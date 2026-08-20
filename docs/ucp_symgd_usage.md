@@ -72,7 +72,9 @@ vừa vượt ngưỡng confidence. Nếu tỷ lệ này luôn gần 0, thử gi
 ## Chi phí tài nguyên
 
 Mỗi iteration ở round được kích hoạt thêm một forward student và một forward
-EMA teacher trên batch gồm hai mixed volume. UAMT vốn đã chạy nhiều forward để
+EMA teacher trên hai mixed view cho mỗi mẫu unlabeled, tức batch forward gồm
+`2 * N_u` mixed volumes (`N_u` là số mẫu unlabeled; cấu hình mặc định `1 + 1`
+cho hai volumes). UAMT vốn đã chạy nhiều forward để
 ước lượng uncertainty nên cần theo dõi VRAM chặt hơn MT. Khi thiếu VRAM, giảm
 `--patch_size` theo bội số phù hợp với bốn lần downsampling của U-Net. Giữ
 `--batch_size` ở mức tối thiểu 2 để vẫn có một phần labeled và một phần
