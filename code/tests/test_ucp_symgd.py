@@ -136,6 +136,33 @@ class UcpSymgdTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_ucp_symgd_config("dan", 2, 0.3, 0.6, 0.95, 1.0, enabled=True)
 
+    def test_non_finite_weight_is_rejected(self):
+        for weight in (float("nan"), float("inf")):
+            with self.subTest(weight=weight), self.assertRaisesRegex(
+                    ValueError, "symgd_weight must be finite"):
+                validate_ucp_symgd_config("mt", 2, 0.3, 0.6, 0.95, weight)
+
+    def test_label_shapes_must_match_corresponding_images(self):
+        images = torch.zeros(2, 1, 4, 4, 4)
+        labels = torch.zeros(2, 4, 4, 4, dtype=torch.long)
+        cases = (
+            (labels[:1], labels, "labeled labels"),
+            (labels[:, :3], labels, "labeled labels"),
+            (labels, labels[:1], "unlabeled labels"),
+            (labels, labels[:, :3], "unlabeled labels"),
+        )
+        for labeled_labels, unlabeled_labels, message in cases:
+            with self.subTest(message=message, shapes=(labeled_labels.shape, unlabeled_labels.shape)), self.assertRaisesRegex(
+                    ValueError, message):
+                unified_copy_paste(
+                    images,
+                    labeled_labels,
+                    images,
+                    unlabeled_labels,
+                    0.5,
+                    0.5,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -10,8 +12,8 @@ def validate_ucp_symgd_config(backbone, start_round, scale_min, scale_max,
         raise ValueError("UCP scales must satisfy 0 < min <= max <= 1")
     if not 0 <= confidence <= 1:
         raise ValueError("symgd_confidence must be between 0 and 1")
-    if weight < 0:
-        raise ValueError("symgd_weight must be non-negative")
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError("symgd_weight must be finite and non-negative")
     if enabled and backbone not in {"mt", "uamt"}:
         raise ValueError("--ucp_symgd supports only mt and uamt")
 
@@ -49,6 +51,10 @@ def unified_copy_paste(labeled_images, labeled_labels, unlabeled_images,
         raise ValueError("labels must have shape [N, D, H, W]")
     if labeled_images.shape[0] == 0 or unlabeled_images.shape[0] == 0:
         raise ValueError("labeled and unlabeled batches must be nonempty")
+    if labeled_labels.shape != (labeled_images.shape[0], *labeled_images.shape[-3:]):
+        raise ValueError("labeled labels must match labeled images shape [N, D, H, W]")
+    if unlabeled_labels.shape != (unlabeled_images.shape[0], *unlabeled_images.shape[-3:]):
+        raise ValueError("unlabeled labels must match unlabeled images shape [N, D, H, W]")
     if labeled_images.shape[1:] != unlabeled_images.shape[1:]:
         raise ValueError("labeled and unlabeled image shapes must match")
     if labeled_labels.shape[1:] != unlabeled_labels.shape[1:]:
