@@ -30,6 +30,10 @@ from dataloaders.brats2019 import (RandomCrop, RandomRotFlip,
                                    ToTensor, TwoStreamBatchSampler)
 from networks.net_factory_3d import net_factory_3d
 from utils import losses, ramps
+from utils.ucp_symgd import (masked_cross_entropy, merge_unlabeled_view,
+                             symgd_ramp_weight, symmetric_guidance_mask,
+                             ucp_symgd_enabled, unified_copy_paste,
+                             validate_ucp_symgd_config)
 
 from segment_anything.build_sam3D import sam_model_registry3D
 
@@ -60,6 +64,13 @@ parser.add_argument('--sam_ckpt', type=str, default='pretrained_ckpt/sam_med3d_t
 parser.add_argument('--prompt', type=str, default='unc')
 parser.add_argument('--image_key', type=str, default='image')
 parser.add_argument('--binary_label', action='store_true')
+parser.add_argument('--ucp_symgd', action='store_true',
+                    help='Enable UCP/SymGD for MT/UAMT')
+parser.add_argument('--ucp_start_round', type=int, default=2)
+parser.add_argument('--ucp_scale_min', type=float, default=0.3)
+parser.add_argument('--ucp_scale_max', type=float, default=0.6)
+parser.add_argument('--symgd_confidence', type=float, default=0.95)
+parser.add_argument('--symgd_weight', type=float, default=1.0)
 # resuming
 parser.add_argument('--resume_round', type=int, default=0,
                     help='Round number to resume from (e.g. 2). 0 means no resume.')
@@ -565,6 +576,50 @@ def _log_validation(avg_metric, round_num, iter_num, num_classes):
     return mean_dice
 
 
+def _compute_ucp_symgd_losses(args, round_num, iter_num, student, teacher,
+                              volume_batch, label_batch, direct_student_logits,
+                              direct_teacher_logits, ce_loss, dice_loss):
+    zero = direct_student_logits.sum() * 0.0
+    if not ucp_symgd_enabled(args.ucp_symgd, round_num, args.ucp_start_round):
+        return zero, zero, 0.0, 0.0
+
+    labeled_images = volume_batch[:args.labeled_bs]
+    labeled_labels = label_batch[:args.labeled_bs]
+    unlabeled_images = volume_batch[args.labeled_bs:]
+    unlabeled_labels = label_batch[args.labeled_bs:]
+    u_in, q_in, u_out, q_out, mask = unified_copy_paste(
+        labeled_images, labeled_labels, unlabeled_images, unlabeled_labels,
+        args.ucp_scale_min, args.ucp_scale_max)
+    unlabeled_count = unlabeled_images.shape[0]
+    mixed_images = torch.cat((u_in, u_out), dim=0)
+    mixed_student_logits = student(mixed_images)
+    student_in, student_out = mixed_student_logits.split(unlabeled_count)
+    student_in_probs = torch.softmax(student_in, dim=1)
+    student_out_probs = torch.softmax(student_out, dim=1)
+    inward_loss = 0.5 * (
+        ce_loss(student_in, q_in) + dice_loss(student_in_probs, q_in.unsqueeze(1)))
+    outward_loss = 0.5 * (
+        ce_loss(student_out, q_out) + dice_loss(student_out_probs, q_out.unsqueeze(1)))
+    ucp_loss = 0.5 * (inward_loss + outward_loss)
+
+    with torch.no_grad():
+        mixed_teacher_logits = teacher(mixed_images)
+        teacher_in, teacher_out = mixed_teacher_logits.split(unlabeled_count)
+        merged_probs = merge_unlabeled_view(
+            torch.softmax(teacher_in, dim=1),
+            torch.softmax(teacher_out, dim=1),
+            mask)
+        direct_probs = torch.softmax(direct_teacher_logits, dim=1)
+        guidance_mask = symmetric_guidance_mask(
+            direct_probs, merged_probs, args.symgd_confidence)
+
+    symgd_loss = masked_cross_entropy(
+        direct_student_logits, merged_probs, guidance_mask)
+    kept_ratio = guidance_mask.float().mean().item()
+    gamma = symgd_ramp_weight(iter_num, args.max_iterations, args.symgd_weight)
+    return ucp_loss, symgd_loss, kept_ratio, gamma
+
+
 # ---- MT ----
 def train_one_round_mt(args, round_num, snapshot_path, pseudo_labels, image_list, writer,
                        resume_ckpt=None, resume_iter=0):
@@ -652,9 +707,13 @@ def train_one_round_mt(args, round_num, snapshot_path, pseudo_labels, image_list
                                     label_batch[args.labeled_bs:].unsqueeze(1))
             pseudo_loss = 0.5 * (pseudo_ce + pseudo_dice)
             pseudo_weight = min(1.0, iter_num / (max_iterations * 0.3))
+            ucp_loss, symgd_loss, symgd_kept, symgd_gamma = _compute_ucp_symgd_losses(
+                args, round_num, iter_num, model, ema_model, volume_batch,
+                label_batch, outputs[args.labeled_bs:], ema_output, ce_loss,
+                dice_loss)
 
             loss = supervised_loss + consistency_weight * consistency_loss + \
-                pseudo_weight * pseudo_loss
+                pseudo_weight * (pseudo_loss + ucp_loss) + symgd_gamma * symgd_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -666,10 +725,25 @@ def train_one_round_mt(args, round_num, snapshot_path, pseudo_labels, image_list
                 param_group['lr'] = lr_
             iter_num += 1
 
+            if symgd_gamma:
+                writer.add_scalar('train/ucp_loss', ucp_loss.item(), iter_num)
+                writer.add_scalar('train/symgd_loss', symgd_loss.item(), iter_num)
+                writer.add_scalar('train/symgd_kept_ratio', symgd_kept, iter_num)
+                writer.add_scalar('train/symgd_weight', symgd_gamma, iter_num)
+
             if iter_num % 100 == 0:
-                logging.info('Round %d iter %d : loss=%.4f, sup=%.4f, cons=%.4f, pseudo=%.4f',
-                             round_num, iter_num, loss.item(), supervised_loss.item(),
-                             consistency_loss.item(), pseudo_loss.item())
+                if symgd_gamma:
+                    logging.info(
+                        'Round %d iter %d : loss=%.4f, sup=%.4f, cons=%.4f, '
+                        'pseudo=%.4f, ucp=%.4f, sym=%.4f, kept=%.4f, gamma=%.4f',
+                        round_num, iter_num, loss.item(), supervised_loss.item(),
+                        consistency_loss.item(), pseudo_loss.item(), ucp_loss.item(),
+                        symgd_loss.item(), symgd_kept, symgd_gamma)
+                else:
+                    logging.info(
+                        'Round %d iter %d : loss=%.4f, sup=%.4f, cons=%.4f, pseudo=%.4f',
+                        round_num, iter_num, loss.item(), supervised_loss.item(),
+                        consistency_loss.item(), pseudo_loss.item())
 
             if iter_num > 0 and iter_num % 200 == 0:
                 model.eval()
@@ -773,9 +847,13 @@ def train_one_round_uamt(args, round_num, snapshot_path, pseudo_labels, image_li
                                     label_batch[args.labeled_bs:].unsqueeze(1))
             pseudo_loss = 0.5 * (pseudo_ce + pseudo_dice)
             pseudo_weight = min(1.0, iter_num / (max_iterations * 0.3))
+            ucp_loss, symgd_loss, symgd_kept, symgd_gamma = _compute_ucp_symgd_losses(
+                args, round_num, iter_num, model, ema_model, volume_batch,
+                label_batch, outputs[args.labeled_bs:], ema_output, ce_loss,
+                dice_loss)
 
             loss = supervised_loss + consistency_weight * consistency_loss + \
-                pseudo_weight * pseudo_loss
+                pseudo_weight * (pseudo_loss + ucp_loss) + symgd_gamma * symgd_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -787,10 +865,25 @@ def train_one_round_uamt(args, round_num, snapshot_path, pseudo_labels, image_li
                 param_group['lr'] = lr_
             iter_num += 1
 
+            if symgd_gamma:
+                writer.add_scalar('train/ucp_loss', ucp_loss.item(), iter_num)
+                writer.add_scalar('train/symgd_loss', symgd_loss.item(), iter_num)
+                writer.add_scalar('train/symgd_kept_ratio', symgd_kept, iter_num)
+                writer.add_scalar('train/symgd_weight', symgd_gamma, iter_num)
+
             if iter_num % 100 == 0:
-                logging.info('Round %d iter %d : loss=%.4f, sup=%.4f, cons=%.4f, pseudo=%.4f',
-                             round_num, iter_num, loss.item(), supervised_loss.item(),
-                             consistency_loss.item(), pseudo_loss.item())
+                if symgd_gamma:
+                    logging.info(
+                        'Round %d iter %d : loss=%.4f, sup=%.4f, cons=%.4f, '
+                        'pseudo=%.4f, ucp=%.4f, sym=%.4f, kept=%.4f, gamma=%.4f',
+                        round_num, iter_num, loss.item(), supervised_loss.item(),
+                        consistency_loss.item(), pseudo_loss.item(), ucp_loss.item(),
+                        symgd_loss.item(), symgd_kept, symgd_gamma)
+                else:
+                    logging.info(
+                        'Round %d iter %d : loss=%.4f, sup=%.4f, cons=%.4f, pseudo=%.4f',
+                        round_num, iter_num, loss.item(), supervised_loss.item(),
+                        consistency_loss.item(), pseudo_loss.item())
 
             if iter_num > 0 and iter_num % 200 == 0:
                 model.eval()
@@ -1032,6 +1125,10 @@ BACKBONE_TRAINERS = {
 
 
 def main():
+    validate_ucp_symgd_config(
+        args.backbone, args.ucp_start_round, args.ucp_scale_min,
+        args.ucp_scale_max, args.symgd_confidence, args.symgd_weight,
+        enabled=args.ucp_symgd)
     if args.deterministic:
         cudnn.benchmark = False
         cudnn.deterministic = True
