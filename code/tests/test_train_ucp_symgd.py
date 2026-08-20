@@ -48,10 +48,23 @@ class TinySegmentor(nn.Module):
     def __init__(self):
         super().__init__()
         self.calls = 0
+        self.scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, images):
         self.calls += 1
-        return torch.cat((-images, images), dim=1)
+        return torch.cat((-images * self.scale, images * self.scale), dim=1)
+
+
+class RecordingWriter:
+    def __init__(self):
+        self.scalars = []
+
+    def add_scalar(self, name, value, step):
+        self.scalars.append((name, value, step))
+
+
+def _identity_cuda(value, *args, **kwargs):
+    return value
 
 
 class TrainIntegrationTests(unittest.TestCase):
@@ -114,7 +127,38 @@ class TrainIntegrationTests(unittest.TestCase):
         self.assertLessEqual(kept, 1.0)
         self.assertAlmostEqual(gamma, 0.55)
         (ucp + sym).backward()
-        self.assertIsNotNone(direct_student.grad)
+        self.assertGreater(direct_student.grad.abs().sum().item(), 0.0)
+        self.assertGreater(student.scale.grad.abs().item(), 0.0)
+        self.assertGreater(volume.grad.abs().sum().item(), 0.0)
+        self.assertTrue(all(parameter.grad is None for parameter in teacher.parameters()))
+
+    def test_active_ucp_logs_metrics_at_zero_symgd_weight_for_mt_and_uamt(self):
+        volume = torch.linspace(-1, 1, 128).reshape(2, 1, 4, 4, 4)
+        labels = (volume[:, 0] > 0).long()
+        batch = {"image": volume, "label": labels}
+        expected_metrics = {
+            "train/ucp_loss",
+            "train/symgd_loss",
+            "train/symgd_kept_ratio",
+            "train/symgd_weight",
+        }
+        for backbone in ("mt", "uamt"):
+            with self.subTest(backbone=backbone):
+                student = TinySegmentor()
+                teacher = TinySegmentor()
+                writer = RecordingWriter()
+                args = types.SimpleNamespace(**vars(self.train.args))
+                args.backbone = backbone
+                args.max_iterations = 1
+                args.symgd_weight = 0.0
+                with patch.object(self.train, "net_factory_3d",
+                                  side_effect=(student, teacher)), \
+                        patch.object(self.train, "_make_dataloader", return_value=[batch]), \
+                        patch.object(self.train.torch.nn.Module, "cuda", _identity_cuda), \
+                        patch.object(self.train.torch.Tensor, "cuda", _identity_cuda):
+                    self.train.BACKBONE_TRAINERS[backbone](
+                        args, 2, "unused", None, None, writer)
+                self.assertEqual({name for name, _, _ in writer.scalars}, expected_metrics)
 
 
 if __name__ == "__main__":

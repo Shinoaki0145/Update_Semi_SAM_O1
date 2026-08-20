@@ -707,6 +707,8 @@ def train_one_round_mt(args, round_num, snapshot_path, pseudo_labels, image_list
                                     label_batch[args.labeled_bs:].unsqueeze(1))
             pseudo_loss = 0.5 * (pseudo_ce + pseudo_dice)
             pseudo_weight = min(1.0, iter_num / (max_iterations * 0.3))
+            ucp_active = ucp_symgd_enabled(
+                args.ucp_symgd, round_num, args.ucp_start_round)
             ucp_loss, symgd_loss, symgd_kept, symgd_gamma = _compute_ucp_symgd_losses(
                 args, round_num, iter_num, model, ema_model, volume_batch,
                 label_batch, outputs[args.labeled_bs:], ema_output, ce_loss,
@@ -725,14 +727,14 @@ def train_one_round_mt(args, round_num, snapshot_path, pseudo_labels, image_list
                 param_group['lr'] = lr_
             iter_num += 1
 
-            if symgd_gamma:
+            if ucp_active:
                 writer.add_scalar('train/ucp_loss', ucp_loss.item(), iter_num)
                 writer.add_scalar('train/symgd_loss', symgd_loss.item(), iter_num)
                 writer.add_scalar('train/symgd_kept_ratio', symgd_kept, iter_num)
                 writer.add_scalar('train/symgd_weight', symgd_gamma, iter_num)
 
             if iter_num % 100 == 0:
-                if symgd_gamma:
+                if ucp_active:
                     logging.info(
                         'Round %d iter %d : loss=%.4f, sup=%.4f, cons=%.4f, '
                         'pseudo=%.4f, ucp=%.4f, sym=%.4f, kept=%.4f, gamma=%.4f',
@@ -847,6 +849,8 @@ def train_one_round_uamt(args, round_num, snapshot_path, pseudo_labels, image_li
                                     label_batch[args.labeled_bs:].unsqueeze(1))
             pseudo_loss = 0.5 * (pseudo_ce + pseudo_dice)
             pseudo_weight = min(1.0, iter_num / (max_iterations * 0.3))
+            ucp_active = ucp_symgd_enabled(
+                args.ucp_symgd, round_num, args.ucp_start_round)
             ucp_loss, symgd_loss, symgd_kept, symgd_gamma = _compute_ucp_symgd_losses(
                 args, round_num, iter_num, model, ema_model, volume_batch,
                 label_batch, outputs[args.labeled_bs:], ema_output, ce_loss,
@@ -865,14 +869,14 @@ def train_one_round_uamt(args, round_num, snapshot_path, pseudo_labels, image_li
                 param_group['lr'] = lr_
             iter_num += 1
 
-            if symgd_gamma:
+            if ucp_active:
                 writer.add_scalar('train/ucp_loss', ucp_loss.item(), iter_num)
                 writer.add_scalar('train/symgd_loss', symgd_loss.item(), iter_num)
                 writer.add_scalar('train/symgd_kept_ratio', symgd_kept, iter_num)
                 writer.add_scalar('train/symgd_weight', symgd_gamma, iter_num)
 
             if iter_num % 100 == 0:
-                if symgd_gamma:
+                if ucp_active:
                     logging.info(
                         'Round %d iter %d : loss=%.4f, sup=%.4f, cons=%.4f, '
                         'pseudo=%.4f, ucp=%.4f, sym=%.4f, kept=%.4f, gamma=%.4f',
